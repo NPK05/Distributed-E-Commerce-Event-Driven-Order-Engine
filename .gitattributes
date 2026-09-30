@@ -1,0 +1,10 @@
+# Normalize line endings so shell scripts run in Docker/Linux even when cloned on Windows.
+* text=auto
+*.sh text eol=lf
+*.java text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sql text eol=lf
+Makefile text eol=lf
+Dockerfile text eol=lf
+*.Dockerfile text eol=lf

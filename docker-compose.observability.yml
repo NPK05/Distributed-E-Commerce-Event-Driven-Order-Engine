@@ -1,0 +1,25 @@
+# Metrics stack. Use together with the main file:
+#   docker compose -f docker-compose.yml -f docker-compose.observability.yml up --build
+# Prometheus: http://localhost:9090   Grafana: http://localhost:3001 (admin / admin)
+# Traces are always on via Jaeger in the main file: http://localhost:16686
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    image: grafana/grafana:11.2.2
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus

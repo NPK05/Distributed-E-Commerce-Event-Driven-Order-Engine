@@ -1,0 +1,274 @@
+# Full stack: infrastructure + all services + frontend.
+#   cp .env.example .env
+#   docker compose up --build
+# Add metrics dashboards with:
+#   docker compose -f docker-compose.yml -f docker-compose.observability.yml up --build
+
+x-service-env: &service-env
+  KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+  OTLP_TRACING_ENDPOINT: http://jaeger:4318/v1/traces
+  JAVA_OPTS: "-XX:MaxRAMPercentage=75 -XX:+UseG1GC"
+
+x-db-env: &db-env
+  DB_HOST: postgres
+  DB_USER: ${POSTGRES_USER:-ecommerce}
+  DB_PASSWORD: ${POSTGRES_PASSWORD:-ecommerce}
+
+x-service-build: &service-build
+  context: .
+  dockerfile: docker/service.Dockerfile
+
+x-healthcheck: &actuator-health
+  interval: 10s
+  timeout: 5s
+  retries: 18
+  start_period: 40s
+
+services:
+  # ---------------------------------------------------------------- infrastructure
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: 3
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ecommerce}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ecommerce}
+      POSTGRES_DB: postgres
+    volumes:
+      - ./infra/postgres/init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh:ro
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ecommerce}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    ports:
+      - "9200:9200"
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "8025:8025"   # web inbox: http://localhost:8025
+      - "1025:1025"   # SMTP
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    ports:
+      - "16686:16686" # UI: http://localhost:16686
+      - "4318:4318"   # OTLP HTTP
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+
+  # ---------------------------------------------------------------- services
+  api-gateway:
+    build: { <<: *service-build, args: { SERVICE: api-gateway } }
+    restart: unless-stopped
+    ports: ["8080:8080"]
+    environment:
+      <<: *service-env
+      JWT_SECRET: ${JWT_SECRET:-change-me-to-a-long-random-string-of-32-plus-chars}
+      AUTH_URI: http://auth-service:8081
+      CATALOG_URI: http://catalog-service:8082
+      CART_URI: http://cart-service:8083
+      ORDER_URI: http://order-service:8084
+      INVENTORY_URI: http://inventory-service:8085
+      PAYMENT_URI: http://payment-service:8086
+      SHIPPING_URI: http://shipping-service:8087
+      NOTIFICATION_URI: http://notification-service:8088
+      SEARCH_URI: http://search-service:8089
+      REDIS_HOST: redis
+      CORS_ALLOWED_ORIGINS: http://localhost:3000
+    depends_on:
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health | grep -q UP"]
+      <<: *actuator-health
+
+  auth-service:
+    build: { <<: *service-build, args: { SERVICE: auth-service } }
+    restart: unless-stopped
+    ports: ["8081:8081"]
+    environment:
+      <<: [*service-env, *db-env]
+      JWT_SECRET: ${JWT_SECRET:-change-me-to-a-long-random-string-of-32-plus-chars}
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8081/actuator/health | grep -q UP"]
+      <<: *actuator-health
+
+  catalog-service:
+    build: { <<: *service-build, args: { SERVICE: catalog-service } }
+    restart: unless-stopped
+    ports: ["8082:8082"]
+    environment:
+      <<: *service-env
+      MONGO_URI: mongodb://mongo:27017/catalog_db
+    depends_on:
+      mongo: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+
+  cart-service:
+    build: { <<: *service-build, args: { SERVICE: cart-service } }
+    restart: unless-stopped
+    ports: ["8083:8083"]
+    environment:
+      <<: *service-env
+      REDIS_HOST: redis
+      CATALOG_URI: http://catalog-service:8082
+    depends_on:
+      redis: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+
+  order-service:
+    build: { <<: *service-build, args: { SERVICE: order-service } }
+    restart: unless-stopped
+    ports: ["8084:8084"]
+    environment:
+      <<: [*service-env, *db-env]
+      CART_URI: http://cart-service:8083
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+
+  inventory-service:
+    build: { <<: *service-build, args: { SERVICE: inventory-service } }
+    restart: unless-stopped
+    ports: ["8085:8085"]
+    environment:
+      <<: [*service-env, *db-env]
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+
+  payment-service:
+    build: { <<: *service-build, args: { SERVICE: payment-service } }
+    restart: unless-stopped
+    ports: ["8086:8086"]
+    environment:
+      <<: [*service-env, *db-env]
+      PAYMENT_DECLINE_ABOVE: ${PAYMENT_DECLINE_ABOVE:-5000}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+
+  shipping-service:
+    build: { <<: *service-build, args: { SERVICE: shipping-service } }
+    restart: unless-stopped
+    ports: ["8087:8087"]
+    environment:
+      <<: [*service-env, *db-env]
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+
+  notification-service:
+    build: { <<: *service-build, args: { SERVICE: notification-service } }
+    restart: unless-stopped
+    ports: ["8088:8088"]
+    environment:
+      <<: [*service-env, *db-env]
+      SMTP_HOST: mailpit
+      SMTP_PORT: 1025
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+
+  search-service:
+    build: { <<: *service-build, args: { SERVICE: search-service } }
+    restart: unless-stopped
+    ports: ["8089:8089"]
+    environment:
+      <<: *service-env
+      ELASTICSEARCH_URI: http://elasticsearch:9200
+    depends_on:
+      elasticsearch: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+
+  # ---------------------------------------------------------------- frontend
+  web:
+    build:
+      context: ./apps/web
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8080}
+    ports: ["3000:3000"]
+    depends_on:
+      - api-gateway
+
+volumes:
+  postgres-data:
+  mongo-data:
+  es-data:
